@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from cumm import tensorview as tv
+import os
 import torch
 from typing import Dict, Optional, List, Union
 from spconv.constants import AllocKeys
@@ -100,7 +101,12 @@ def get_current_stream():
 
 
 def get_arch():
-    arch = torch.cuda.get_device_capability()
+    force_arch = os.getenv("SPCONV_FORCE_CUDA_ARCH", "")
+    if force_arch:
+        force_arch = force_arch.replace(".", "")
+        arch = (int(force_arch[:-1]), int(force_arch[-1]))
+    else:
+        arch = torch.cuda.get_device_capability()
     if not CompileInfo.arch_is_compatible(arch) and not CompileInfo.algo_can_use_ptx((0, 0), arch):
         warnings.warn(
             f"[WARNING]your gpu arch {arch} isn't compiled in prebuilt, "

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from enum import Enum
 from cumm.gemm.main import gen_shuffle_params_v2 as gen_shuffle_params, GemmAlgoParams
 from cumm.gemm import kernel
@@ -1337,6 +1338,65 @@ if not SPCONV_INT8_DEBUG:
                         is_nvrtc=True,
                         int8_inference=True),
     ])
+
+def _is_ampere_param(param):
+    return param.algo == GemmAlgo.Ampere
+
+
+def _is_simt_param(param):
+    return param.algo == GemmAlgo.Simt
+
+
+def _is_static_param(param):
+    return not getattr(param, "is_nvrtc", False)
+
+
+def _is_non_int8_param(param):
+    return not getattr(param, "int8_inference", False)
+
+
+def _is_ampere_no_int8_static_param(param):
+    return _is_ampere_param(param) and _is_static_param(param) and _is_non_int8_param(param)
+
+
+def _filter_params(params, predicate):
+    return [param for param in params if predicate(param)]
+
+
+def _force_static_params(params, predicate):
+    for param in params:
+        if predicate(param):
+            param.is_nvrtc = False
+    return params
+
+
+def _clear_turing_volta():
+    global SHUFFLE_TURING_PARAMS, SHUFFLE_VOLTA_PARAMS
+    global IMPLGEMM_TURING_PARAMS, IMPLGEMM_VOLTA_PARAMS
+    SHUFFLE_TURING_PARAMS = []
+    SHUFFLE_VOLTA_PARAMS = []
+    IMPLGEMM_TURING_PARAMS = []
+    IMPLGEMM_VOLTA_PARAMS = []
+
+
+_DTK_KERNEL_FILTER = os.getenv("SPCONV_DTK_KERNEL_FILTER", "").lower()
+if _DTK_KERNEL_FILTER == "dtk_simt":
+    SHUFFLE_SIMT_PARAMS = _force_static_params(SHUFFLE_SIMT_PARAMS, _is_simt_param)
+    SHUFFLE_AMPERE_PARAMS = []
+    IMPLGEMM_SIMT_PARAMS = _force_static_params(IMPLGEMM_SIMT_PARAMS, _is_simt_param)
+    IMPLGEMM_AMPERE_PARAMS = []
+    _clear_turing_volta()
+elif _DTK_KERNEL_FILTER == "dtk_tensorop":
+    SHUFFLE_SIMT_PARAMS = _force_static_params(SHUFFLE_SIMT_PARAMS, _is_simt_param)
+    SHUFFLE_AMPERE_PARAMS = _filter_params(SHUFFLE_AMPERE_PARAMS, _is_ampere_no_int8_static_param)
+    IMPLGEMM_SIMT_PARAMS = _force_static_params(IMPLGEMM_SIMT_PARAMS, _is_simt_param)
+    IMPLGEMM_AMPERE_PARAMS = _filter_params(IMPLGEMM_AMPERE_PARAMS, _is_ampere_no_int8_static_param)
+    _clear_turing_volta()
+elif _DTK_KERNEL_FILTER == "":
+    pass
+else:
+    raise ValueError(f"unknown SPCONV_DTK_KERNEL_FILTER: {_DTK_KERNEL_FILTER}")
+
 
 ALL_NATIVE_PARAMS = SHUFFLE_SIMT_PARAMS + SHUFFLE_TURING_PARAMS + SHUFFLE_VOLTA_PARAMS + SHUFFLE_AMPERE_PARAMS
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import os
 import time
 from enum import Enum
 from threading import Lock
@@ -728,7 +729,8 @@ class SimpleConv:
                 if (desp.tensorop[0] > 0 and inp.dtype == tv.float32 
                         and weight.dtype == tv.float32 and out.dtype == tv.float32):
                     continue
-            if arch >= (7, 0) and is_fp16:
+            allow_dtk_fp16_simt = os.getenv("SPCONV_DTK_KERNEL_FILTER", "").lower() == "dtk_simt"
+            if arch >= (7, 0) and is_fp16 and not allow_dtk_fp16_simt:
                 if desp.algo == GemmAlgo.Simt:
                     continue
                 if use_f32_as_accum:

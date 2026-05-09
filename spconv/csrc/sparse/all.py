@@ -36,7 +36,7 @@ class CustomThrustLib(pccm.Class):
         super().__init__()
         self.add_dependency(ThrustLib)
         # https://github.com/NVIDIA/thrust/issues/1401#issuecomment-806403746
-        if compat.InLinux:
+        if compat.InLinux and os.getenv("CUMM_DTK_DISABLE_INLINE_PTX", "0") != "1":
             self.build_meta.add_public_cflags("nvcc", "-Xcompiler -fno-gnu-unique", "-Xcompiler -fvisibility=hidden")
 
 

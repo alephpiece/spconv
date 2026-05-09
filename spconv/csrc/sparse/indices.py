@@ -35,6 +35,7 @@ class CudaCommonKernel(pccm.ParameterizedClass):
     @pccm.cuda.cuda_global_function
     def arange_kernel(self):
         code = pccm.FunctionCode()
+        code.add_pre_attr("__launch_bounds__(1024)")
         code.targ("T")
         code.arg("data", f"T*")
         code.arg("size", f"int")
@@ -48,6 +49,7 @@ class CudaCommonKernel(pccm.ParameterizedClass):
     @pccm.cuda.cuda_global_function
     def fill_kernel(self):
         code = pccm.FunctionCode()
+        code.add_pre_attr("__launch_bounds__(1024)")
         code.targ("T")
         code.arg("data", f"T*")
         code.arg("val", f"T")
@@ -62,6 +64,7 @@ class CudaCommonKernel(pccm.ParameterizedClass):
     @pccm.cuda.cuda_global_function
     def maximum_value_kernel(self):
         code = pccm.FunctionCode()
+        code.add_pre_attr("__launch_bounds__(1024)")
         code.targ("T")
         code.arg("data", f"T*")
         code.arg("val", f"T")
@@ -723,6 +726,7 @@ class SparseConvIndicesKernel(pccm.ParameterizedClass):
     @pccm.cuda.cuda_global_function
     def build_subm_conv_hash_table(self):
         code = pccm.FunctionCode()
+        code.add_pre_attr("__launch_bounds__(1024)")
         code.targ("TTable")
         code.targ("TLayoutNPQ")
 
@@ -806,6 +810,7 @@ class SparseConvIndicesKernel(pccm.ParameterizedClass):
     @pccm.cuda.cuda_global_function
     def calc_subm_conv_indices_mask(self):
         code = pccm.FunctionCode()
+        code.add_pre_attr("__launch_bounds__(1024)")
         code.targ("TTable")
         code.targ("TConvLocIter")
         code.arg("loc_iter", f"TConvLocIter")  # [N, ndim + 1]

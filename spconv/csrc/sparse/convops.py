@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 import pccm
 from cumm.common import GemmBasicHost, NlohmannJson, TensorView
@@ -1058,7 +1059,8 @@ class ConvTunerSimple(pccm.ParameterizedClass):
                     continue;
                 }}
             }}
-            if (arch >= std::make_tuple(7, 0) && is_fp16){{
+            bool allow_dtk_fp16_simt = {pccm.boolean(os.getenv("SPCONV_DTK_KERNEL_FILTER", "").lower() == "dtk_simt")};
+            if (arch >= std::make_tuple(7, 0) && is_fp16 && !allow_dtk_fp16_simt){{
                 // skip simt fp16 kernels if we have tensor core
                 if (desp.algo == {pccm.literal(GemmAlgo.Simt.value)}){{
                     continue;
