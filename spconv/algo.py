@@ -91,6 +91,40 @@ class BestConvAlgoByProfile:
         self.arch = arch
 
 
+def _is_dtk_certified_maskimplicit_fwd(desp: ConvAlgoDesp,
+                                       inp: tv.Tensor,
+                                       weight: tv.Tensor,
+                                       out: tv.Tensor,
+                                       arch: Tuple[int, int],
+                                       op_type: ConvOpType,
+                                       kv: int) -> bool:
+    """Certified DTK/BW150 fp32 SubM MaskImplicitGemm subset.
+
+    This intentionally covers only the MV2DFusion VVM/SubM shape family that
+    has been validated against a dense oracle. Other shapes still use the
+    broader DTK SIMT set until they are certified separately.
+    """
+    if os.getenv("SPCONV_DTK_KERNEL_FILTER", "").lower() != "dtk_simt":
+        return True
+    if arch != (9, 3):
+        return True
+    if op_type != ConvOpType.kForward:
+        return True
+    if not (inp.dtype == tv.float32 and weight.dtype == tv.float32
+            and out.dtype == tv.float32):
+        return True
+    if not (kv == 27 and out.dim(1) == 64 and inp.dim(1) == 128):
+        return True
+    return (desp.algo == GemmAlgo.Simt.value
+            and tuple(desp.tile_shape) == (32, 256, 8)
+            and tuple(desp.warp_tile_shape) == (32, 64, 8)
+            and tuple(desp.tensorop) == (-1, -1, -1)
+            and desp.increment_k_first
+            and desp.mask_sparse
+            and not desp.dynamic_mask
+            and not desp.split_k_serial)
+
+
 def _get_nvrtc_params(mod: CummNVRTCModule, ker: Union[GemmKernel, ConvKernel],
                       kernel_name: str):
     nvrtc_mode = SPCONV_NVRTC_MODE
@@ -778,6 +812,9 @@ class SimpleConv:
                 else:
                     if desp.dynamic_mask:
                         continue 
+                if not _is_dtk_certified_maskimplicit_fwd(
+                        desp, inp, weight, out, arch, op_type, kv):
+                    continue
                 finally_algos.append(desp)
         return finally_algos
 

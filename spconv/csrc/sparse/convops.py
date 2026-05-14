@@ -1122,6 +1122,36 @@ class ConvTunerSimple(pccm.ParameterizedClass):
                         continue;
                     }}
                 }}
+                bool dtk_certified_maskimplicit_shape =
+                    {pccm.boolean(os.getenv("SPCONV_DTK_KERNEL_FILTER", "").lower() == "dtk_simt")} &&
+                    arch == std::make_tuple(9, 3) &&
+                    op_type_cpp == tv::gemm::ConvOpType::kForward &&
+                    inp.dtype() == tv::float32 &&
+                    weight.dtype() == tv::float32 &&
+                    out.dtype() == tv::float32 &&
+                    kv == 27 &&
+                    out.dim(1) == 64 &&
+                    inp.dim(1) == 128;
+                if (dtk_certified_maskimplicit_shape){{
+                    bool dtk_certified_desp =
+                        desp.algo == {pccm.literal(GemmAlgo.Simt.value)} &&
+                        desp.tile_shape[0] == 32 &&
+                        desp.tile_shape[1] == 256 &&
+                        desp.tile_shape[2] == 8 &&
+                        desp.warp_tile_shape[0] == 32 &&
+                        desp.warp_tile_shape[1] == 64 &&
+                        desp.warp_tile_shape[2] == 8 &&
+                        desp.tensorop[0] == -1 &&
+                        desp.tensorop[1] == -1 &&
+                        desp.tensorop[2] == -1 &&
+                        desp.increment_k_first &&
+                        desp.mask_sparse &&
+                        !desp.dynamic_mask &&
+                        !desp.split_k_serial();
+                    if (!dtk_certified_desp){{
+                        continue;
+                    }}
+                }}
                 finally_algos.push_back(desp2);
             }}
         }}
