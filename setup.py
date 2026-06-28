@@ -22,6 +22,10 @@ setup(
     author="Yan Yan, ZJLi2013 (ROCm port)",
     python_requires=">=3.10",
     packages=find_packages(exclude=("tests",)),
+    include_package_data=True,
+    package_data={
+        "spconv": ["csrc_hip/*.cpp", "csrc_hip/*.hip", "csrc_hip/*.h"],
+    },
     install_requires=[
         "torch",
         "numpy",

@@ -1,4 +1,4 @@
-# spconv-rocm: Sparse convolution layers (ROCm, pure Python, Native path only)
+# spconv-rocm: Sparse convolution layers for the ROCm source adaptation.
 
 import math
 from typing import List, Optional, Tuple, Union
@@ -17,7 +17,7 @@ from spconv.constants import ALL_WEIGHT_IS_KRSC
 
 
 class SparseConvolution(SparseModule):
-    """Base sparse convolution layer — ROCm version (Native path only)."""
+    """Base sparse convolution layer for the ROCm Native-layout dispatch."""
 
     def __init__(self,
                  ndim: int,
@@ -50,7 +50,7 @@ class SparseConvolution(SparseModule):
         self.transposed = transposed
         self.inverse = inverse
         self.indice_key = indice_key
-        self.algo = ConvAlgo.Native  # ROCm: always Native
+        self.algo = ConvAlgo.Native  # ROCm dispatch starts from Native indices.
 
         kv = int(np.prod(self.kernel_size))
         self.conv1x1 = (kv == 1) and (int(np.prod(self.stride)) == 1)
@@ -121,11 +121,25 @@ class SparseConvolution(SparseModule):
                 spatial_shape, self.kernel_size, self.stride,
                 self.padding, self.dilation)
 
-        # Get or compute indice pairs
+        # Get or compute indice pairs.
         datas = input.find_indice_pair(self.indice_key) if self.indice_key else None
-
-        if datas is not None:
+        if self.inverse:
+            assert datas is not None and self.indice_key is not None, (
+                "inverse conv requires existing indice_key from coupled forward conv"
+            )
+            assert not datas.is_subm, (
+                "inverse conv can only be used with standard conv/pool indice data"
+            )
+            if datas.ksize is not None:
+                assert datas.ksize == self.kernel_size, (
+                    "inverse conv must have same kernel size as its couple conv"
+                )
             outids = datas.indices
+            indice_pairs = datas.indice_pairs
+            indice_pair_num = datas.indice_pair_num
+            out_spatial_shape = datas.spatial_shape
+        elif datas is not None:
+            outids = datas.out_indices
             indice_pairs = datas.indice_pairs
             indice_pair_num = datas.indice_pair_num
         else:
@@ -137,13 +151,24 @@ class SparseConvolution(SparseModule):
 
             if self.indice_key is not None:
                 indice_data = IndiceData(
-                    outids, indice_pairs, indice_pair_num,
-                    out_spatial_shape, self.subm, self.algo)
+                    indices,
+                    indice_pairs,
+                    indice_pair_num,
+                    spatial_shape,
+                    self.subm,
+                    self.algo,
+                    out_indices=outids,
+                    out_spatial_shape=out_spatial_shape,
+                    ksize=self.kernel_size,
+                    stride=self.stride,
+                    padding=self.padding,
+                    dilation=self.dilation,
+                )
                 input.indice_dict[self.indice_key] = indice_data
 
         num_out = outids.shape[0]
 
-        # Native sparse conv: gather → GEMM → scatter
+        # Sparse convolution dispatch; ops.py chooses fused HIP or fallback.
         out_features = ops.indice_conv(
             features, self.weight, indice_pairs, indice_pair_num,
             num_out, inverse=self.inverse, subm=self.subm)
