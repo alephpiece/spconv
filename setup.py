@@ -10,7 +10,7 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 with open("version.txt", "r") as f:
     version = f.read().strip()
 
-version += "+rocm1"
+version += "+dtk2604"
 
 setup(
     name="spconv-rocm",

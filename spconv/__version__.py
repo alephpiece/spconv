@@ -1,1 +1,1 @@
-__version__ = '2.3.8+rocm1'
+__version__ = '2.3.8+dtk2604'
