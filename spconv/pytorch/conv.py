@@ -10,6 +10,7 @@ from torch.nn.parameter import Parameter
 
 from spconv.core import ConvAlgo
 from spconv.pytorch.core import SparseConvTensor, IndiceData, expand_nd
+from spconv.pytorch.flexgemm_adapter import try_flexgemm_subm_conv
 from spconv.pytorch import ops
 from spconv.pytorch.ops import _gemm
 from spconv.pytorch.modules import SparseModule
@@ -108,6 +109,10 @@ class SparseConvolution(SparseModule):
                 out_features = out_features + self.bias
             out_tensor = input.replace_feature(out_features)
             return out_tensor
+
+        flexgemm_out = try_flexgemm_subm_conv(self, input)
+        if flexgemm_out is not None:
+            return flexgemm_out
 
         # Compute output spatial shape
         if self.transposed:
