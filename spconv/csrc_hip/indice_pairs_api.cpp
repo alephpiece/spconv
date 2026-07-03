@@ -8,11 +8,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/hip/HIPBlas.h>
 
-// DetZero ROCm adaptation note:
-// This file extends the official ROCm source with a sourceful spconv-level
-// fused fp32 route and explicit backward path. Keep future changes validated by
-// the DetZero fixture and SubMConv3d benchmark gates.
-
 namespace spconv_hip {
 
 template <typename K>
@@ -41,6 +36,21 @@ void build_indice_conv_lut(
     int dup_capacity,
     int num_out,
     int kv,
+    int work_n,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    bool skip_center,
+    hipStream_t stream);
+
+template <typename IndexT>
+void build_indice_conv_lut_unique(
+    const IndexT* indice_pairs,
+    const int* indice_num_per_loc,
+    int* lut,
+    int num_out,
+    int kv,
+    int work_n,
     int nmax,
     int gather_axis,
     int scatter_axis,
@@ -57,6 +67,7 @@ void build_indice_conv_lut_epoch(
     int* dup_count_dev,
     int dup_capacity,
     int kv,
+    int work_n,
     int nmax,
     int gather_axis,
     int scatter_axis,
@@ -515,7 +526,7 @@ static bool check_use_int32(const std::vector<int>& spatial_shape, int batch_siz
 }
 
 // SubM indice pairs: input == output points.
-// Returns: (indice_pairs [2, kv, N], indice_pair_num [kv])
+// Returns: (indice_pairs [kv, 2, N], indice_pair_num [kv])
 std::vector<torch::Tensor> get_indice_pairs_subm(
     torch::Tensor indices,       // [N, ndim+1] int32 on GPU
     int batch_size,
@@ -560,7 +571,7 @@ std::vector<torch::Tensor> get_indice_pairs_subm(
 }
 
 // Regular/transposed conv indice pairs.
-// Returns: (out_indices [N_out, ndim+1], indice_pairs [2, kv, N], indice_pair_num [kv])
+// Returns: (out_indices [N_out, ndim+1], indice_pairs [kv, 2, N], indice_pair_num [kv])
 std::vector<torch::Tensor> get_indice_pairs_conv(
     torch::Tensor indices,       // [N, ndim+1] int32 on GPU
     int batch_size,
@@ -738,7 +749,8 @@ torch::Tensor indice_conv_forward_fused(
     int64_t num_activate_out,
     bool inverse,
     bool subm,
-    bool filters_transposed = false)
+    bool filters_transposed = false,
+    bool assume_unique_indices_arg = false)
 {
     TORCH_CHECK(features.is_cuda(), "features must be on GPU");
     TORCH_CHECK(filters.is_cuda(), "filters must be on GPU");
@@ -763,11 +775,18 @@ torch::Tensor indice_conv_forward_fused(
     int gather_axis = inverse ? 1 : 0;
     int scatter_axis = inverse ? 0 : 1;
     bool skip_center = subm && !inverse;
+    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
     auto& workspace = get_workspace(features.device());
 
+    bool assume_unique_indices = assume_unique_indices_arg;
+    if (const char* env = std::getenv("SPCONV_ASSUME_UNIQUE_INDICES")) {
+        assume_unique_indices = assume_unique_indices || std::atoi(env) != 0;
+    }
     bool use_epoch_lut = false;
-    if (const char* env = std::getenv("SPCONV_USE_EPOCH_LUT")) {
-        use_epoch_lut = std::atoi(env) != 0;
+    if (!assume_unique_indices) {
+        if (const char* env = std::getenv("SPCONV_USE_EPOCH_LUT")) {
+            use_epoch_lut = std::atoi(env) != 0;
+        }
     }
     torch::Tensor lut;
     torch::Tensor lut_state;
@@ -795,7 +814,30 @@ torch::Tensor indice_conv_forward_fused(
     auto dup_count_dev = ensure_buffer(
         workspace.fused_dup_count, 1,
         features.device(), torch::kInt32, "fused_dup_count");
-    hipStream_t stream = (hipStream_t)at::cuda::getCurrentCUDAStream().stream();
+    auto pn_host = ensure_host_buffer(
+        workspace.host_indice_pair_num, kv, torch::kInt32, "host_indice_pair_num");
+    auto* pn = pn_host.data_ptr<int>();
+    hipError_t pn_status = hipMemcpyAsync(
+        pn,
+        indice_pair_num.data_ptr<int>(),
+        kv * sizeof(int),
+        hipMemcpyDeviceToHost,
+        stream);
+    TORCH_CHECK(pn_status == hipSuccess,
+                "hipMemcpyAsync indice_pair_num failed: ",
+                hipGetErrorString(pn_status));
+    hipError_t pn_sync_status = hipStreamSynchronize(stream);
+    TORCH_CHECK(pn_sync_status == hipSuccess,
+                "hipStreamSynchronize indice_pair_num failed: ",
+                hipGetErrorString(pn_sync_status));
+    int lut_work_n = 0;
+    int center = kv / 2;
+    for (int i = 0; i < kv; ++i) {
+        if (skip_center && i == center) {
+            continue;
+        }
+        lut_work_n = std::max(lut_work_n, pn[i]);
+    }
 
     if (indice_pairs.scalar_type() == torch::kLong) {
         if (use_epoch_lut) {
@@ -808,11 +850,25 @@ torch::Tensor indice_conv_forward_fused(
                 dup_count_dev.data_ptr<int>(),
                 static_cast<int>(dup_capacity),
                 kv,
+                lut_work_n,
                 nmax,
                 gather_axis,
                 scatter_axis,
                 skip_center,
                 lut_epoch,
+                stream);
+        } else if (assume_unique_indices) {
+            spconv_hip::build_indice_conv_lut_unique<int64_t>(
+                indice_pairs.data_ptr<int64_t>(),
+                indice_pair_num.data_ptr<int>(),
+                lut.data_ptr<int>(),
+                num_activate_out,
+                kv,
+                lut_work_n,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                skip_center,
                 stream);
         } else {
             spconv_hip::build_indice_conv_lut<int64_t>(
@@ -825,6 +881,7 @@ torch::Tensor indice_conv_forward_fused(
                 static_cast<int>(dup_capacity),
                 num_activate_out,
                 kv,
+                lut_work_n,
                 nmax,
                 gather_axis,
                 scatter_axis,
@@ -842,11 +899,25 @@ torch::Tensor indice_conv_forward_fused(
                 dup_count_dev.data_ptr<int>(),
                 static_cast<int>(dup_capacity),
                 kv,
+                lut_work_n,
                 nmax,
                 gather_axis,
                 scatter_axis,
                 skip_center,
                 lut_epoch,
+                stream);
+        } else if (assume_unique_indices) {
+            spconv_hip::build_indice_conv_lut_unique<int>(
+                indice_pairs.data_ptr<int>(),
+                indice_pair_num.data_ptr<int>(),
+                lut.data_ptr<int>(),
+                num_activate_out,
+                kv,
+                lut_work_n,
+                nmax,
+                gather_axis,
+                scatter_axis,
+                skip_center,
                 stream);
         } else {
             spconv_hip::build_indice_conv_lut<int>(
@@ -859,6 +930,7 @@ torch::Tensor indice_conv_forward_fused(
                 static_cast<int>(dup_capacity),
                 num_activate_out,
                 kv,
+                lut_work_n,
                 nmax,
                 gather_axis,
                 scatter_axis,
@@ -893,19 +965,21 @@ torch::Tensor indice_conv_forward_fused(
         skip_center,
         filters_transposed,
         stream);
-    spconv_hip::launch_indice_conv_accumulate_duplicates_f32(
-        features.data_ptr<float>(),
-        filters.data_ptr<float>(),
-        dup_slots.data_ptr<int>(),
-        dup_inp.data_ptr<int>(),
-        dup_count_dev.data_ptr<int>(),
-        static_cast<int>(dup_capacity),
-        out_features.data_ptr<float>(),
-        kv,
-        c_in,
-        c_out,
-        filters_transposed,
-        stream);
+    if (!assume_unique_indices) {
+        spconv_hip::launch_indice_conv_accumulate_duplicates_f32(
+            features.data_ptr<float>(),
+            filters.data_ptr<float>(),
+            dup_slots.data_ptr<int>(),
+            dup_inp.data_ptr<int>(),
+            dup_count_dev.data_ptr<int>(),
+            static_cast<int>(dup_capacity),
+            out_features.data_ptr<float>(),
+            kv,
+            c_in,
+            c_out,
+            filters_transposed,
+            stream);
+    }
 
     return out_features;
 }
@@ -1352,6 +1426,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                   num_activate_out, inverse, subm, false);
           },
           "Sparse conv forward with fused HIP kernel");
+    m.def("indice_conv_forward_fused_unique",
+          [](torch::Tensor features,
+             torch::Tensor filters,
+             torch::Tensor indice_pairs,
+             torch::Tensor indice_pair_num,
+             int64_t num_activate_out,
+             bool inverse,
+             bool subm) {
+              return indice_conv_forward_fused(
+                  features, filters, indice_pairs, indice_pair_num,
+                  num_activate_out, inverse, subm, false, true);
+          },
+          "Sparse conv forward with fused HIP kernel and unique input pairs");
     m.def("indice_conv_backward", &indice_conv_backward,
           "Sparse conv backward with C++ for-loop");
 }

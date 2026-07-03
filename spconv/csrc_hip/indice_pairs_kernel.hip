@@ -7,10 +7,6 @@
 #include <vector>
 #include "hash_table.h"
 
-// DetZero ROCm adaptation note:
-// The fused sparse-conv kernels below are part of this sourceful DetZero
-// backend. Treat algorithm edits as benchmark-gated changes.
-
 namespace spconv_hip {
 
 namespace {
@@ -205,7 +201,7 @@ template <typename K>
 __global__ void calc_subm_conv_indices_kernel(
     LinearHashTable<K, int> table,
     const int* __restrict__ indices_in,  // [N, ndim+1]
-    int* __restrict__ indice_pairs,      // [2, kv, N]
+    int* __restrict__ indice_pairs,      // [kv, 2, N]
     int* __restrict__ indice_num_per_loc, // [kv]
     ConvProblem problem,
     int num_indices,
@@ -213,10 +209,9 @@ __global__ void calc_subm_conv_indices_kernel(
     int kv)
 {
     int filter_offset = blockIdx.y;
-    int filter_offset_mul_ips = filter_offset * indices_pair_size;
+    int filter_pair_base = filter_offset * 2 * indices_pair_size;
     int mirror_offset = kv - 1 - filter_offset;
-    int mirror_offset_mul_ips = mirror_offset * indices_pair_size;
-    int ips_mul_kv = indices_pair_size * kv;
+    int mirror_pair_base = mirror_offset * 2 * indices_pair_size;
 
     if (filter_offset == kv / 2) {
         if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -226,8 +221,8 @@ __global__ void calc_subm_conv_indices_kernel(
         for (int i = blockIdx.x * blockDim.x + threadIdx.x;
              i < num_indices;
              i += gridDim.x * blockDim.x) {
-            indice_pairs[filter_offset_mul_ips + i] = i;
-            indice_pairs[ips_mul_kv + filter_offset_mul_ips + i] = i;
+            indice_pairs[filter_pair_base + i] = i;
+            indice_pairs[filter_pair_base + indices_pair_size + i] = i;
         }
     } else {
         // Compute filter indices for this offset.
@@ -261,11 +256,11 @@ __global__ void calc_subm_conv_indices_kernel(
                     // indice_pairs[0] = input (gather source), [1] = output (scatter dest)
                     // For filter_offset: i queries, v is the neighbor found
                     //   → gather from v (input), scatter to i (output)
-                    indice_pairs[filter_offset_mul_ips + old_num] = v;
-                    indice_pairs[ips_mul_kv + filter_offset_mul_ips + old_num] = i;
+                    indice_pairs[filter_pair_base + old_num] = v;
+                    indice_pairs[filter_pair_base + indices_pair_size + old_num] = i;
                     // Mirror: reversed — gather from i, scatter to v
-                    indice_pairs[mirror_offset_mul_ips + old_num] = i;
-                    indice_pairs[ips_mul_kv + mirror_offset_mul_ips + old_num] = v;
+                    indice_pairs[mirror_pair_base + old_num] = i;
+                    indice_pairs[mirror_pair_base + indices_pair_size + old_num] = v;
                 }
             }
         }
@@ -281,7 +276,7 @@ __global__ void calc_subm_conv_indices_kernel(
 template <typename K>
 __global__ void calc_conv_indices_stage1_kernel(
     const int* __restrict__ indices_in,  // [N, ndim+1]
-    int* __restrict__ indice_pairs_in,   // [kv, N] — stores input indices
+    int* __restrict__ indice_pairs_in,   // [kv, 2, N] — stores input indices in axis 0
     K* __restrict__ indice_pairs_uniq,   // [kv * N + 1] — stores output coord offsets
     int* __restrict__ indice_num_per_loc, // [kv]
     ConvProblem problem,
@@ -292,6 +287,7 @@ __global__ void calc_conv_indices_stage1_kernel(
 {
     int filter_offset = blockIdx.y;
     int fo_mul_ips = filter_offset * indices_pair_size;
+    int filter_pair_base = filter_offset * 2 * indices_pair_size;
 
     int r[kMaxNDim];
     filter_offset_to_ndim(filter_offset, r, problem.ksize, problem.ndim);
@@ -330,7 +326,7 @@ __global__ void calc_conv_indices_stage1_kernel(
             int old_num = atomicAdd(indice_num_per_loc + filter_offset, 1);
             K offset = coord_to_linear<K>(out_coord, problem.output_dims, problem.ndim);
             if (old_num < indices_pair_size) {
-                indice_pairs_in[fo_mul_ips + old_num] = i;
+                indice_pairs_in[filter_pair_base + old_num] = i;
                 indice_pairs_uniq[fo_mul_ips + old_num] = offset;
             }
         }
@@ -375,14 +371,14 @@ template <typename K>
 __global__ void calc_conv_indices_stage2_kernel(
     LinearHashTable<K, int> table,
     const K* __restrict__ indice_pairs_uniq_before_sort,  // [kv, N]
-    int* __restrict__ indice_pairs_out,  // [kv, N]
+    int* __restrict__ indice_pairs_out,  // [kv, 2, N]
     int num_indices_in,
     int indices_pair_size)
 {
     int filter_offset = blockIdx.y;
     int fo_mul_ips = filter_offset * indices_pair_size;
     const K* uniq_filter = indice_pairs_uniq_before_sort + fo_mul_ips;
-    int* out_filter = indice_pairs_out + fo_mul_ips;
+    int* out_filter = indice_pairs_out + filter_offset * 2 * indices_pair_size + indices_pair_size;
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x;
          i < num_indices_in;
@@ -427,23 +423,53 @@ __global__ void build_indice_conv_lut_kernel(
     const IndexT* inp_inds = indice_pairs + pair_base + gather_axis * nmax;
     const IndexT* out_inds = indice_pairs + pair_base + scatter_axis * nmax;
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < nhot;
-         i += gridDim.x * blockDim.x) {
-        int inp = static_cast<int>(inp_inds[i]);
-        int out = static_cast<int>(out_inds[i]);
-        if (inp >= 0 && out >= 0) {
-            int slot = out * kv + filter_offset;
-            int prev = atomicCAS(lut + slot, -1, inp);
-            if (prev != -1 && prev != inp) {
-                int dup_idx = atomicAdd(dup_meta, 1);
-                if (dup_idx < dup_capacity) {
-                    dup_slots[dup_idx] = slot;
-                    dup_inp[dup_idx] = inp;
-                }
-            }
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nhot) {
+        return;
+    }
+    int inp = static_cast<int>(inp_inds[i]);
+    int out = static_cast<int>(out_inds[i]);
+    int slot = out * kv + filter_offset;
+    int prev = atomicCAS(lut + slot, -1, inp);
+    if (prev != -1 && prev != inp) {
+        int dup_idx = atomicAdd(dup_meta, 1);
+        if (dup_idx < dup_capacity) {
+            dup_slots[dup_idx] = slot;
+            dup_inp[dup_idx] = inp;
         }
     }
+}
+
+
+template <typename IndexT>
+__global__ void build_indice_conv_lut_unique_kernel(
+    const IndexT* __restrict__ indice_pairs,   // [kv, 2, N]
+    const int* __restrict__ indice_num_per_loc, // [kv]
+    int* __restrict__ lut,                      // [num_out, kv]
+    int kv,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    int center,
+    bool skip_center)
+{
+    int filter_offset = blockIdx.y;
+    if (skip_center && filter_offset == center) {
+        return;
+    }
+
+    int nhot = indice_num_per_loc[filter_offset];
+    int pair_base = filter_offset * 2 * nmax;
+    const IndexT* inp_inds = indice_pairs + pair_base + gather_axis * nmax;
+    const IndexT* out_inds = indice_pairs + pair_base + scatter_axis * nmax;
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nhot) {
+        return;
+    }
+    int inp = static_cast<int>(inp_inds[i]);
+    int out = static_cast<int>(out_inds[i]);
+    lut[out * kv + filter_offset] = inp;
 }
 
 template <typename IndexT>
@@ -473,37 +499,33 @@ __global__ void build_indice_conv_lut_epoch_kernel(
     const IndexT* inp_inds = indice_pairs + pair_base + gather_axis * nmax;
     const IndexT* out_inds = indice_pairs + pair_base + scatter_axis * nmax;
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < nhot;
-         i += gridDim.x * blockDim.x) {
-        int inp = static_cast<int>(inp_inds[i]);
-        int out = static_cast<int>(out_inds[i]);
-        if (inp < 0 || out < 0) {
-            continue;
-        }
-
-        int slot = out * kv + filter_offset;
-        unsigned long long desired = pack_lut_epoch_value(lut_epoch, inp);
-        unsigned long long old = lut_state[slot];
-        while (true) {
-            int old_inp = unpack_lut_epoch_value(old, lut_epoch);
-            if (old_inp >= 0) {
-                if (old_inp != inp) {
-                    int dup_idx = atomicAdd(dup_meta, 1);
-                    if (dup_idx < dup_capacity) {
-                        dup_slots[dup_idx] = slot;
-                        dup_inp[dup_idx] = inp;
-                    }
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nhot) {
+        return;
+    }
+    int inp = static_cast<int>(inp_inds[i]);
+    int out = static_cast<int>(out_inds[i]);
+    int slot = out * kv + filter_offset;
+    unsigned long long desired = pack_lut_epoch_value(lut_epoch, inp);
+    unsigned long long old = lut_state[slot];
+    while (true) {
+        int old_inp = unpack_lut_epoch_value(old, lut_epoch);
+        if (old_inp >= 0) {
+            if (old_inp != inp) {
+                int dup_idx = atomicAdd(dup_meta, 1);
+                if (dup_idx < dup_capacity) {
+                    dup_slots[dup_idx] = slot;
+                    dup_inp[dup_idx] = inp;
                 }
-                break;
             }
-
-            unsigned long long observed = atomicCAS(lut_state + slot, old, desired);
-            if (observed == old) {
-                break;
-            }
-            old = observed;
+            break;
         }
+
+        unsigned long long observed = atomicCAS(lut_state + slot, old, desired);
+        if (observed == old) {
+            break;
+        }
+        old = observed;
     }
 }
 
@@ -517,6 +539,168 @@ __global__ void mirror_indice_num_per_loc_kernel(
         return;
     }
     indice_num_per_loc[kv - 1 - k] = indice_num_per_loc[k];
+}
+
+
+
+
+__global__ void indice_conv_accumulate_duplicates_f32_c32x32_v4_kernel(
+    const float* __restrict__ features,
+    const float* __restrict__ filters,
+    const int* __restrict__ dup_slots,
+    const int* __restrict__ dup_inp,
+    const int* __restrict__ dup_count_ptr,
+    float* __restrict__ out,
+    int kv)
+{
+    int total = dup_count_ptr[0] * 8;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += blockDim.x * gridDim.x) {
+        int dup_idx = idx >> 3;
+        int co_base = (idx & 7) << 2;
+        int slot = dup_slots[dup_idx];
+        int inp = dup_inp[dup_idx];
+        int out_row = slot / kv;
+        int k = slot - out_row * kv;
+
+        const float* feat = features + inp * 32;
+        const float* weight = filters + k * 32 * 32 + co_base;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        #pragma unroll
+        for (int ci = 0; ci < 32; ++ci) {
+            float f = feat[ci];
+            const float* w = weight + ci * 32;
+            acc0 += f * w[0];
+            acc1 += f * w[1];
+            acc2 += f * w[2];
+            acc3 += f * w[3];
+        }
+        float* out_ptr = out + out_row * 32 + co_base;
+        atomicAdd(out_ptr + 0, acc0);
+        atomicAdd(out_ptr + 1, acc1);
+        atomicAdd(out_ptr + 2, acc2);
+        atomicAdd(out_ptr + 3, acc3);
+    }
+}
+
+__global__ void indice_conv_accumulate_duplicates_f32_c32x32_mmac_kernel(
+    const float* __restrict__ features,
+    const float* __restrict__ filters,
+    const int* __restrict__ dup_slots,
+    const int* __restrict__ dup_inp,
+    const int* __restrict__ dup_count_ptr,
+    float* __restrict__ out,
+    int kv)
+{
+#if defined(__gfx936__) || defined(__gfx938__)
+    __shared__ int sh_slot[16];
+    __shared__ int sh_inp[16];
+
+    int wave = threadIdx.x >> 6;
+    int lane = threadIdx.x & 63;
+    int row = lane & 15;
+    int col_group = lane >> 4;
+    int tile_col_base = wave * 16;
+    int col0 = tile_col_base + col_group + 0;
+    int col1 = tile_col_base + col_group + 4;
+    int col2 = tile_col_base + col_group + 8;
+    int col3 = tile_col_base + col_group + 12;
+    int dup_count = dup_count_ptr[0];
+
+    for (int dup_base = blockIdx.x * 16;
+         dup_base < dup_count;
+         dup_base += gridDim.x * 16) {
+        int dup_idx = dup_base + row;
+        if (threadIdx.x < 16) {
+            int load_idx = dup_base + threadIdx.x;
+            if (load_idx < dup_count) {
+                sh_slot[threadIdx.x] = dup_slots[load_idx];
+                sh_inp[threadIdx.x] = dup_inp[load_idx];
+            } else {
+                sh_slot[threadIdx.x] = -1;
+                sh_inp[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
+
+        int slot = sh_slot[row];
+        int inp = sh_inp[row];
+        bool valid = dup_idx < dup_count && slot >= 0 && inp >= 0;
+        int out_row = valid ? slot / kv : 0;
+        int k = valid ? (slot - out_row * kv) : 0;
+        const float* feat = valid ? features + inp * 32 : nullptr;
+        const float* filt_k = filters + k * 32 * 32;
+        v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+        #pragma unroll
+        for (int ck = 0; ck < 32; ck += 8) {
+            v2f va = {0.0f, 0.0f};
+            v2f vb = {0.0f, 0.0f};
+            int a_ci0 = ck + col_group * 2 + 0;
+            int a_ci1 = ck + col_group * 2 + 1;
+            if (valid) {
+                va[0] = feat[a_ci0];
+                va[1] = feat[a_ci1];
+            }
+            int b_col = tile_col_base + row;
+            vb[0] = filt_k[a_ci0 * 32 + b_col];
+            vb[1] = filt_k[a_ci1 * 32 + b_col];
+            acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va, vb, acc);
+        }
+
+        if (valid) {
+            float* out_ptr = out + out_row * 32;
+            atomicAdd(out_ptr + col0, acc[0]);
+            atomicAdd(out_ptr + col1, acc[1]);
+            atomicAdd(out_ptr + col2, acc[2]);
+            atomicAdd(out_ptr + col3, acc[3]);
+        }
+        __syncthreads();
+    }
+#else
+    (void)features;
+    (void)filters;
+    (void)dup_slots;
+    (void)dup_inp;
+    (void)dup_count_ptr;
+    (void)out;
+    (void)kv;
+#endif
+}
+
+__global__ void indice_conv_accumulate_duplicates_f32_c32x32_kernel(
+    const float* __restrict__ features,
+    const float* __restrict__ filters,
+    const int* __restrict__ dup_slots,
+    const int* __restrict__ dup_inp,
+    const int* __restrict__ dup_count_ptr,
+    float* __restrict__ out,
+    int kv)
+{
+    int total = dup_count_ptr[0] * 32;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += blockDim.x * gridDim.x) {
+        int dup_idx = idx >> 5;
+        int co = idx & 31;
+        int slot = dup_slots[dup_idx];
+        int inp = dup_inp[dup_idx];
+        int out_row = slot / kv;
+        int k = slot - out_row * kv;
+
+        const float* feat = features + inp * 32;
+        const float* weight = filters + k * 32 * 32 + co;
+        float acc = 0.0f;
+        #pragma unroll
+        for (int ci = 0; ci < 32; ++ci) {
+            acc += feat[ci] * weight[ci * 32];
+        }
+        atomicAdd(out + out_row * 32 + co, acc);
+    }
 }
 
 __global__ void indice_conv_accumulate_duplicates_f32_kernel(
@@ -825,6 +1009,9 @@ __global__ void indice_conv_fused_forward_f32_mmac_multiwave_kernel(
     }
 
     for (int k = 0; k < kv; ++k) {
+        if (accumulate_existing && k == kv / 2) {
+            continue;
+        }
         if (threadIdx.x < 16) {
             int load_row = blockIdx.x * 16 + threadIdx.x;
             if (load_row < num_out) {
@@ -1197,6 +1384,330 @@ __global__ void indice_conv_fused_forward_f32_mmac_multiwave_static_c_kernel(
     (void)num_out;
     (void)kv;
     (void)c_out;
+    (void)lut_epoch;
+    (void)accumulate_existing;
+#endif
+}
+
+
+
+__global__ void indice_conv_fused_forward_f32_mmac_multiwave_c32x64_direct_kernel(
+    const float* __restrict__ features,   // [N_in, 32]
+    const float* __restrict__ filters,    // [kv, 32, 64]
+    const int* __restrict__ lut,          // [N_out, kv]
+    const unsigned long long* __restrict__ lut_state,
+    float* __restrict__ out,              // [N_out, 64]
+    int num_out,
+    int kv,
+    unsigned int lut_epoch,
+    bool accumulate_existing)
+{
+#if defined(__gfx936__) || defined(__gfx938__)
+    __shared__ int sh_inp[16];
+
+    int wave = threadIdx.x >> 6;
+    int lane = threadIdx.x & 63;
+    int row = lane & 15;
+    int col_group = lane >> 4;
+    int out_row = blockIdx.x * 16 + row;
+    int tile_col_base = wave * 16;
+    int col0 = tile_col_base + col_group + 0;
+    int col1 = tile_col_base + col_group + 4;
+    int col2 = tile_col_base + col_group + 8;
+    int col3 = tile_col_base + col_group + 12;
+    bool row_valid = out_row < num_out;
+
+    v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (accumulate_existing && row_valid) {
+        acc[0] = out[out_row * 64 + col0];
+        acc[1] = out[out_row * 64 + col1];
+        acc[2] = out[out_row * 64 + col2];
+        acc[3] = out[out_row * 64 + col3];
+    }
+
+    for (int k = 0; k < kv; ++k) {
+        if (accumulate_existing && k == kv / 2) {
+            continue;
+        }
+        if (threadIdx.x < 16) {
+            int load_row = blockIdx.x * 16 + threadIdx.x;
+            if (load_row < num_out) {
+                int slot = load_row * kv + k;
+                sh_inp[threadIdx.x] = lut_state
+                    ? unpack_lut_epoch_value(lut_state[slot], lut_epoch)
+                    : lut[slot];
+            } else {
+                sh_inp[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
+        int inp = row_valid ? sh_inp[row] : -1;
+        __syncthreads();
+
+        #pragma unroll
+        for (int ck = 0; ck < 32; ck += 8) {
+            v2f va = {0.0f, 0.0f};
+            v2f vb = {0.0f, 0.0f};
+            int a_ci0 = ck + col_group * 2 + 0;
+            int a_ci1 = ck + col_group * 2 + 1;
+            if (inp >= 0) {
+                va[0] = features[inp * 32 + a_ci0];
+                va[1] = features[inp * 32 + a_ci1];
+            }
+
+            int b_col = tile_col_base + row;
+            vb[0] = filters[(k * 32 + a_ci0) * 64 + b_col];
+            vb[1] = filters[(k * 32 + a_ci1) * 64 + b_col];
+
+            acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va, vb, acc);
+        }
+    }
+
+    if (row_valid) {
+        out[out_row * 64 + col0] = acc[0];
+        out[out_row * 64 + col1] = acc[1];
+        out[out_row * 64 + col2] = acc[2];
+        out[out_row * 64 + col3] = acc[3];
+    }
+#else
+    (void)features;
+    (void)filters;
+    (void)lut;
+    (void)lut_state;
+    (void)out;
+    (void)num_out;
+    (void)kv;
+    (void)lut_epoch;
+    (void)accumulate_existing;
+#endif
+}
+
+__global__ void indice_conv_fused_forward_f32_mmac_multiwave_c32x32_direct_kernel(
+    const float* __restrict__ features,   // [N_in, 32]
+    const float* __restrict__ filters,    // [kv, 32, 32]
+    const int* __restrict__ lut,          // [N_out, kv]
+    const unsigned long long* __restrict__ lut_state,
+    float* __restrict__ out,              // [N_out, 32]
+    int num_out,
+    int kv,
+    unsigned int lut_epoch,
+    bool accumulate_existing)
+{
+#if defined(__gfx936__) || defined(__gfx938__)
+    __shared__ int sh_inp[32];
+
+    int wave = threadIdx.x >> 6;
+    int lane = threadIdx.x & 63;
+    int row = lane & 15;
+    int col_group = lane >> 4;
+    int waves_per_block = blockDim.x >> 6;
+    int row_group = waves_per_block == 4 ? (wave >> 1) : 0;
+    int col_wave = waves_per_block == 4 ? (wave & 1) : wave;
+    int rows_per_block = waves_per_block == 4 ? 32 : 16;
+    int out_row = blockIdx.x * rows_per_block + row_group * 16 + row;
+    int tile_col_base = col_wave * 16;
+    int col0 = tile_col_base + col_group + 0;
+    int col1 = tile_col_base + col_group + 4;
+    int col2 = tile_col_base + col_group + 8;
+    int col3 = tile_col_base + col_group + 12;
+    bool row_valid = out_row < num_out;
+
+    v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (accumulate_existing && row_valid) {
+        acc[0] = out[out_row * 32 + col0];
+        acc[1] = out[out_row * 32 + col1];
+        acc[2] = out[out_row * 32 + col2];
+        acc[3] = out[out_row * 32 + col3];
+    }
+
+    for (int k = 0; k < kv; ++k) {
+        if (accumulate_existing && k == kv / 2) {
+            continue;
+        }
+        if (threadIdx.x < rows_per_block) {
+            int load_row = blockIdx.x * rows_per_block + threadIdx.x;
+            if (load_row < num_out) {
+                int slot = load_row * kv + k;
+                sh_inp[threadIdx.x] = lut_state
+                    ? unpack_lut_epoch_value(lut_state[slot], lut_epoch)
+                    : lut[slot];
+            } else {
+                sh_inp[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
+        int inp = row_valid ? sh_inp[row_group * 16 + row] : -1;
+        __syncthreads();
+
+        int b_col = tile_col_base + row;
+        int ci_base = col_group * 2;
+        const float* feat = inp >= 0 ? features + inp * 32 : nullptr;
+        const float* filt_k = filters + k * 32 * 32;
+
+        v2f va0 = {0.0f, 0.0f};
+        v2f vb0 = {0.0f, 0.0f};
+        int a00 = ci_base + 0;
+        int a01 = ci_base + 1;
+        if (inp >= 0) {
+            va0[0] = feat[a00];
+            va0[1] = feat[a01];
+        }
+        vb0[0] = filt_k[a00 * 32 + b_col];
+        vb0[1] = filt_k[a01 * 32 + b_col];
+
+        v2f va1 = {0.0f, 0.0f};
+        v2f vb1 = {0.0f, 0.0f};
+        int a10 = ci_base + 8;
+        int a11 = ci_base + 9;
+        if (inp >= 0) {
+            va1[0] = feat[a10];
+            va1[1] = feat[a11];
+        }
+        vb1[0] = filt_k[a10 * 32 + b_col];
+        vb1[1] = filt_k[a11 * 32 + b_col];
+
+        acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va0, vb0, acc);
+
+        v2f va2 = {0.0f, 0.0f};
+        v2f vb2 = {0.0f, 0.0f};
+        int a20 = ci_base + 16;
+        int a21 = ci_base + 17;
+        if (inp >= 0) {
+            va2[0] = feat[a20];
+            va2[1] = feat[a21];
+        }
+        vb2[0] = filt_k[a20 * 32 + b_col];
+        vb2[1] = filt_k[a21 * 32 + b_col];
+
+        acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va1, vb1, acc);
+
+        v2f va3 = {0.0f, 0.0f};
+        v2f vb3 = {0.0f, 0.0f};
+        int a30 = ci_base + 24;
+        int a31 = ci_base + 25;
+        if (inp >= 0) {
+            va3[0] = feat[a30];
+            va3[1] = feat[a31];
+        }
+        vb3[0] = filt_k[a30 * 32 + b_col];
+        vb3[1] = filt_k[a31 * 32 + b_col];
+
+        acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va2, vb2, acc);
+        acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va3, vb3, acc);
+    }
+
+    if (row_valid) {
+        out[out_row * 32 + col0] = acc[0];
+        out[out_row * 32 + col1] = acc[1];
+        out[out_row * 32 + col2] = acc[2];
+        out[out_row * 32 + col3] = acc[3];
+    }
+#else
+    (void)features;
+    (void)filters;
+    (void)lut;
+    (void)lut_state;
+    (void)out;
+    (void)num_out;
+    (void)kv;
+    (void)lut_epoch;
+    (void)accumulate_existing;
+#endif
+}
+
+__global__ void indice_conv_fused_forward_f32_mmac_multiwave_c32x32_kernel(
+    const float* __restrict__ features,   // [N_in, 32]
+    const float* __restrict__ filters,    // [kv, 32, 32]
+    const int* __restrict__ lut,          // [N_out, kv]
+    const unsigned long long* __restrict__ lut_state,
+    float* __restrict__ out,              // [N_out, 32]
+    int num_out,
+    int kv,
+    unsigned int lut_epoch,
+    bool accumulate_existing)
+{
+#if defined(__gfx936__) || defined(__gfx938__)
+    __shared__ int sh_inp[16];
+    __shared__ float sh_feat[16][8];
+
+    int wave = threadIdx.x >> 6;
+    int lane = threadIdx.x & 63;
+    int row = lane & 15;
+    int col_group = lane >> 4;
+    int out_row = blockIdx.x * 16 + row;
+    int tile_col_base = wave * 16;
+    int col0 = tile_col_base + col_group + 0;
+    int col1 = tile_col_base + col_group + 4;
+    int col2 = tile_col_base + col_group + 8;
+    int col3 = tile_col_base + col_group + 12;
+    bool row_valid = out_row < num_out;
+
+    v4f acc = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (accumulate_existing && row_valid) {
+        acc[0] = out[out_row * 32 + col0];
+        acc[1] = out[out_row * 32 + col1];
+        acc[2] = out[out_row * 32 + col2];
+        acc[3] = out[out_row * 32 + col3];
+    }
+
+    for (int k = 0; k < kv; ++k) {
+        if (threadIdx.x < 16) {
+            int load_row = blockIdx.x * 16 + threadIdx.x;
+            if (load_row < num_out) {
+                int slot = load_row * kv + k;
+                sh_inp[threadIdx.x] = lut_state
+                    ? unpack_lut_epoch_value(lut_state[slot], lut_epoch)
+                    : lut[slot];
+            } else {
+                sh_inp[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int ck = 0; ck < 32; ck += 8) {
+            int load_idx = threadIdx.x;
+            if (load_idx < 16 * 8) {
+                int load_row = load_idx >> 3;
+                int load_k = load_idx & 7;
+                int inp = sh_inp[load_row];
+                sh_feat[load_row][load_k] =
+                    inp >= 0 ? features[inp * 32 + ck + load_k] : 0.0f;
+            }
+            __syncthreads();
+
+            v2f va = {0.0f, 0.0f};
+            v2f vb = {0.0f, 0.0f};
+            int a_ci0 = ck + col_group * 2 + 0;
+            int a_ci1 = ck + col_group * 2 + 1;
+            if (row_valid) {
+                va[0] = sh_feat[row][a_ci0 - ck];
+                va[1] = sh_feat[row][a_ci1 - ck];
+            }
+
+            int b_col = tile_col_base + row;
+            vb[0] = filters[(k * 32 + a_ci0) * 32 + b_col];
+            vb[1] = filters[(k * 32 + a_ci1) * 32 + b_col];
+
+            acc = __builtin_amdgcn_mmac_f32_16x16x8f32(va, vb, acc);
+            __syncthreads();
+        }
+    }
+
+    if (row_valid) {
+        out[out_row * 32 + col0] = acc[0];
+        out[out_row * 32 + col1] = acc[1];
+        out[out_row * 32 + col2] = acc[2];
+        out[out_row * 32 + col3] = acc[3];
+    }
+#else
+    (void)features;
+    (void)filters;
+    (void)lut;
+    (void)lut_state;
+    (void)out;
+    (void)num_out;
+    (void)kv;
     (void)lut_epoch;
     (void)accumulate_existing;
 #endif
@@ -1722,7 +2233,7 @@ __global__ void indice_conv_dfilters_f32_mmac_split_kernel(
 template <typename K>
 void generate_subm_conv_inds(
     const int* indices_in,   // [N, ndim+1] on device
-    int* indice_pairs,       // [2, kv, N] on device
+    int* indice_pairs,       // [kv, 2, N] on device
     int* indice_num_per_loc, // [kv] on device
     int num_act_in,
     int batch_size,
@@ -1790,7 +2301,7 @@ void generate_subm_conv_inds(
 template <typename K>
 int generate_conv_inds(
     const int* indices_in,   // [N, ndim+1] on device
-    int* indice_pairs,       // [2, kv, N] on device — first half is input indices
+    int* indice_pairs,       // [kv, 2, N] on device
     int* indice_num_per_loc, // [kv] on device
     int* out_indices,        // [max_out, ndim+1] on device
     int num_act_in,
@@ -1837,7 +2348,7 @@ int generate_conv_inds(
     int blocks_x = (num_act_in + threads - 1) / threads;
     dim3 grid_s1(blocks_x, kv);
     hipLaunchKernelGGL(calc_conv_indices_stage1_kernel<K>, grid_s1, dim3(threads), 0, stream,
-                       indices_in, indice_pairs,  // indice_pairs[0] part
+                       indices_in, indice_pairs,
                        indice_pairs_uniq, indice_num_per_loc,
                        problem, num_act_in, num_act_in, kv, transposed);
 
@@ -1897,7 +2408,7 @@ int generate_conv_inds(
     dim3 grid_s2(blocks_x, kv);
     hipLaunchKernelGGL(calc_conv_indices_stage2_kernel<K>, grid_s2, dim3(threads), 0, stream,
                        table, indice_pairs_uniq_copy,
-                       indice_pairs + kv * num_act_in,  // indice_pairs[1] part
+                       indice_pairs,
                        num_act_in, num_act_in);
 
     return num_out_act;
@@ -1914,16 +2425,24 @@ void build_indice_conv_lut(
     int dup_capacity,
     int num_out,
     int kv,
+    int work_n,
     int nmax,
     int gather_axis,
     int scatter_axis,
     bool skip_center,
     hipStream_t stream)
 {
-    int threads = 256;
+    int threads = 128;
+    if (const char* env = std::getenv("SPCONV_LUT_THREADS")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) {
+            threads = parsed;
+        }
+    }
     hipMemsetAsync(lut, 0xFF, (size_t)num_out * kv * sizeof(int), stream);
     hipMemsetAsync(dup_count_dev, 0, sizeof(int), stream);
-    int blocks_x = (nmax + threads - 1) / threads;
+    work_n = std::max(0, std::min(work_n, nmax));
+    int blocks_x = (work_n + threads - 1) / threads;
     int center = kv / 2;
     hipLaunchKernelGGL(build_indice_conv_lut_kernel<IndexT>,
                        dim3(blocks_x, kv), dim3(threads), 0, stream,
@@ -1931,6 +2450,38 @@ void build_indice_conv_lut(
                        dup_slots, dup_inp, dup_count_dev, dup_capacity,
                        kv, nmax, gather_axis, scatter_axis, center, skip_center);
 }
+
+template <typename IndexT>
+void build_indice_conv_lut_unique(
+    const IndexT* indice_pairs,
+    const int* indice_num_per_loc,
+    int* lut,
+    int num_out,
+    int kv,
+    int work_n,
+    int nmax,
+    int gather_axis,
+    int scatter_axis,
+    bool skip_center,
+    hipStream_t stream)
+{
+    int threads = 128;
+    if (const char* env = std::getenv("SPCONV_LUT_THREADS")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) {
+            threads = parsed;
+        }
+    }
+    hipMemsetAsync(lut, 0xFF, (size_t)num_out * kv * sizeof(int), stream);
+    work_n = std::max(0, std::min(work_n, nmax));
+    int blocks_x = (work_n + threads - 1) / threads;
+    int center = kv / 2;
+    hipLaunchKernelGGL(build_indice_conv_lut_unique_kernel<IndexT>,
+                       dim3(blocks_x, kv), dim3(threads), 0, stream,
+                       indice_pairs, indice_num_per_loc, lut,
+                       kv, nmax, gather_axis, scatter_axis, center, skip_center);
+}
+
 
 template <typename IndexT>
 void build_indice_conv_lut_epoch(
@@ -1942,6 +2493,7 @@ void build_indice_conv_lut_epoch(
     int* dup_count_dev,
     int dup_capacity,
     int kv,
+    int work_n,
     int nmax,
     int gather_axis,
     int scatter_axis,
@@ -1949,9 +2501,10 @@ void build_indice_conv_lut_epoch(
     unsigned int lut_epoch,
     hipStream_t stream)
 {
-    int threads = 256;
+    int threads = 128;
     hipMemsetAsync(dup_count_dev, 0, sizeof(int), stream);
-    int blocks_x = (nmax + threads - 1) / threads;
+    work_n = std::max(0, std::min(work_n, nmax));
+    int blocks_x = (work_n + threads - 1) / threads;
     int center = kv / 2;
     hipLaunchKernelGGL(build_indice_conv_lut_epoch_kernel<IndexT>,
                        dim3(blocks_x, kv), dim3(threads), 0, stream,
@@ -1979,10 +2532,33 @@ void launch_indice_conv_accumulate_duplicates_f32(
     int threads = 256;
     int max_blocks = (dup_capacity * c_out + threads - 1) / threads;
     int blocks = std::max(1, std::min(max_blocks, 4096));
-    hipLaunchKernelGGL(indice_conv_accumulate_duplicates_f32_kernel,
-                       dim3(blocks), dim3(threads), 0, stream,
-                       features, filters, dup_slots, dup_inp,
-                       dup_count_dev, out, kv, c_in, c_out, filters_transposed);
+    if (const char* env = std::getenv("SPCONV_DUP_BLOCKS")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) {
+            blocks = std::max(1, std::min(max_blocks, parsed));
+        }
+    }
+    bool can_dup_mmac = !filters_transposed && c_in == 32 && c_out == 32;
+    bool use_dup_mmac = can_dup_mmac;
+    if (const char* env = std::getenv("SPCONV_DUP_MMAC")) {
+        use_dup_mmac = can_dup_mmac && std::atoi(env) != 0;
+    }
+    if (use_dup_mmac) {
+        hipLaunchKernelGGL(indice_conv_accumulate_duplicates_f32_c32x32_mmac_kernel,
+                           dim3(blocks), dim3(2 * 64), 0, stream,
+                           features, filters, dup_slots, dup_inp,
+                           dup_count_dev, out, kv);
+    } else if (!filters_transposed && c_in == 32 && c_out == 32) {
+        hipLaunchKernelGGL(indice_conv_accumulate_duplicates_f32_c32x32_v4_kernel,
+                           dim3(blocks), dim3(threads), 0, stream,
+                           features, filters, dup_slots, dup_inp,
+                           dup_count_dev, out, kv);
+    } else {
+        hipLaunchKernelGGL(indice_conv_accumulate_duplicates_f32_kernel,
+                           dim3(blocks), dim3(threads), 0, stream,
+                           features, filters, dup_slots, dup_inp,
+                           dup_count_dev, out, kv, c_in, c_out, filters_transposed);
+    }
 }
 
 template <typename IndexT, typename FlatIndexT>
@@ -2078,6 +2654,40 @@ void launch_indice_conv_forward_fused_f32(
                                        out, num_out, kv, c_out, lut_epoch,
                                        accumulate_existing);
                 }
+            } else if (use_static_c && c_in == 32 && c_out == 32) {
+                bool c32x32_lds = false;
+                if (const char* env = std::getenv("SPCONV_C32X32_LDS")) {
+                    c32x32_lds = std::atoi(env) != 0;
+                }
+                if (c32x32_lds) {
+                    dim3 c32x32_grid((num_out + 15) / 16, 1);
+                    hipLaunchKernelGGL(indice_conv_fused_forward_f32_mmac_multiwave_c32x32_kernel,
+                                       c32x32_grid, dim3(2 * 64), 0, stream,
+                                       features, filters, lut,
+                                       reinterpret_cast<const unsigned long long*>(lut_state),
+                                       out, num_out, kv, lut_epoch,
+                                       accumulate_existing);
+                } else {
+                    bool c32x32_rows32 = true;
+                    if (const char* env = std::getenv("SPCONV_C32X32_ROWS32")) {
+                        c32x32_rows32 = std::atoi(env) != 0;
+                    }
+                    dim3 c32x32_grid(c32x32_rows32 ? (num_out + 31) / 32 : (num_out + 15) / 16,
+                                     1);
+                    hipLaunchKernelGGL(indice_conv_fused_forward_f32_mmac_multiwave_c32x32_direct_kernel,
+                                       c32x32_grid, dim3(c32x32_rows32 ? 4 * 64 : 2 * 64), 0, stream,
+                                       features, filters, lut,
+                                       reinterpret_cast<const unsigned long long*>(lut_state),
+                                       out, num_out, kv, lut_epoch,
+                                       accumulate_existing);
+                }
+            } else if (use_static_c && c_in == 32 && c_out == 64) {
+                hipLaunchKernelGGL(indice_conv_fused_forward_f32_mmac_multiwave_c32x64_direct_kernel,
+                                   grid, dim3(4 * 64), 0, stream,
+                                   features, filters, lut,
+                                   reinterpret_cast<const unsigned long long*>(lut_state),
+                                   out, num_out, kv, lut_epoch,
+                                   accumulate_existing);
             } else if (use_static_c && c_in == 32) {
                 hipLaunchKernelGGL((indice_conv_fused_forward_f32_mmac_multiwave_static_c_kernel<32>),
                                    grid, dim3(mmac_waves * 64), 0, stream,
@@ -2245,16 +2855,21 @@ template int generate_conv_inds<int64_t>(
     int, bool, hipStream_t);
 
 template void build_indice_conv_lut<int32_t>(
-    const int*, const int*, int*, int*, int*, int*, int, int, int, int, int, int, bool, hipStream_t);
+    const int*, const int*, int*, int*, int*, int*, int, int, int, int, int, int, int, bool, hipStream_t);
 template void build_indice_conv_lut<int64_t>(
-    const int64_t*, const int*, int*, int*, int*, int*, int, int, int, int, int, int, bool, hipStream_t);
+    const int64_t*, const int*, int*, int*, int*, int*, int, int, int, int, int, int, int, bool, hipStream_t);
+
+template void build_indice_conv_lut_unique<int32_t>(
+    const int*, const int*, int*, int, int, int, int, int, int, bool, hipStream_t);
+template void build_indice_conv_lut_unique<int64_t>(
+    const int64_t*, const int*, int*, int, int, int, int, int, int, bool, hipStream_t);
 
 template void build_indice_conv_lut_epoch<int32_t>(
     const int*, const int*, int64_t*, int*, int*, int*,
-    int, int, int, int, int, bool, unsigned int, hipStream_t);
+    int, int, int, int, int, int, bool, unsigned int, hipStream_t);
 template void build_indice_conv_lut_epoch<int64_t>(
     const int64_t*, const int*, int64_t*, int*, int*, int*,
-    int, int, int, int, int, bool, unsigned int, hipStream_t);
+    int, int, int, int, int, int, bool, unsigned int, hipStream_t);
 
 template void launch_indice_conv_dfilters_f32<int32_t>(
     const float*, const float*, const int*, const int*, float*,

@@ -114,6 +114,11 @@ class SparseConvolution(SparseModule):
         if flexgemm_out is not None:
             return flexgemm_out
 
+        assume_unique_indices = False
+        if not self.inverse:
+            features, indices, assume_unique_indices = ops.coalesce_duplicate_indices(
+                input, features, indices, spatial_shape)
+
         # Compute output spatial shape
         if self.transposed:
             out_spatial_shape = ops.get_deconv_output_size(
@@ -176,7 +181,8 @@ class SparseConvolution(SparseModule):
         # Sparse convolution dispatch; ops.py chooses fused HIP or fallback.
         out_features = ops.indice_conv(
             features, self.weight, indice_pairs, indice_pair_num,
-            num_out, inverse=self.inverse, subm=self.subm)
+            num_out, inverse=self.inverse, subm=self.subm,
+            assume_unique_indices=assume_unique_indices)
 
         if self.bias is not None:
             out_features = out_features + self.bias

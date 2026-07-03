@@ -64,8 +64,8 @@ def _get_hip_module():
                 os.path.join(csrc_dir, 'indice_pairs_api.cpp'),
                 os.path.join(csrc_dir, 'indice_pairs_kernel.hip'),
             ],
-            extra_cflags=['-O3'],
-            extra_cuda_cflags=['-O3'],
+            extra_cflags=['-O3', '-DROCM_VERSION=60300'],
+            extra_cuda_cflags=['-O3', '-DROCM_VERSION=60300'],
             extra_include_paths=extra_include_paths,
             verbose=False,
         )
@@ -163,6 +163,85 @@ def _cast_output_for_autocast(out: torch.Tensor,
     if out.dtype == amp_dtype:
         return out
     return out.to(dtype=amp_dtype)
+
+
+def coalesce_duplicate_indices(input_tensor,
+                               features: torch.Tensor,
+                               indices: torch.Tensor,
+                               spatial_shape: List[int]) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+    """Coalesce duplicate sparse coordinates by summing features."""
+    if os.environ.get("SPCONV_COALESCE_DUPLICATE_INDICES", "1") == "0":
+        return features, indices, False
+    if not (features.is_cuda and indices.is_cuda):
+        return features, indices, False
+    if indices.dtype != torch.int32 or indices.ndim != 2 or features.ndim != 2:
+        return features, indices, False
+    if features.shape[0] != indices.shape[0] or indices.shape[0] == 0:
+        return features, indices, False
+    min_n = int(os.environ.get("SPCONV_COALESCE_DUP_MIN_N", "4096"))
+    if indices.shape[0] < min_n:
+        return features, indices, False
+
+    spatial_shape_tuple = tuple(int(v) for v in spatial_shape)
+    if len(spatial_shape_tuple) != indices.shape[1] - 1:
+        return features, indices, False
+
+    vol = 1
+    for dim in spatial_shape_tuple:
+        vol *= dim
+    if vol <= 0 or vol >= (1 << 62):
+        return features, indices, False
+
+    indices_ptr = indices.data_ptr()
+    cache_valid = (
+        getattr(input_tensor, "_coalesced_indices_ptr", None) == indices_ptr and
+        getattr(input_tensor, "_coalesced_indices_numel", None) == indices.numel() and
+        getattr(input_tensor, "_coalesced_spatial_shape", None) == spatial_shape_tuple
+    )
+    if cache_valid:
+        if getattr(input_tensor, "_coalesced_is_unique", None) is True:
+            return features, indices, True
+        cached_indices = getattr(input_tensor, "_coalesced_indices_cache", None)
+        cached_inverse = getattr(input_tensor, "_coalesced_inverse_cache", None)
+        if (cached_indices is not None and cached_inverse is not None and
+                cached_inverse.numel() == features.shape[0]):
+            out = torch.zeros((cached_indices.shape[0], features.shape[1]),
+                              dtype=features.dtype, device=features.device)
+            out.index_add_(0, cached_inverse, features)
+            return out, cached_indices, True
+
+    keys = indices[:, 0].to(torch.int64)
+    for axis, dim in enumerate(spatial_shape_tuple):
+        keys = keys * dim + indices[:, axis + 1].to(torch.int64)
+    unique_keys, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+    input_tensor._coalesced_indices_ptr = indices_ptr
+    input_tensor._coalesced_indices_numel = indices.numel()
+    input_tensor._coalesced_spatial_shape = spatial_shape_tuple
+
+    if unique_keys.numel() == indices.shape[0]:
+        input_tensor._coalesced_indices_cache = indices
+        input_tensor._coalesced_inverse_cache = None
+        input_tensor._coalesced_is_unique = True
+        return features, indices, True
+
+    decoded = torch.empty((unique_keys.numel(), indices.shape[1]),
+                          dtype=indices.dtype, device=indices.device)
+    rem = unique_keys
+    for axis in range(len(spatial_shape_tuple) - 1, -1, -1):
+        dim = spatial_shape_tuple[axis]
+        decoded[:, axis + 1] = (rem % dim).to(indices.dtype)
+        rem = rem // dim
+    decoded[:, 0] = rem.to(indices.dtype)
+
+    out = torch.zeros((unique_keys.numel(), features.shape[1]),
+                      dtype=features.dtype, device=features.device)
+    out.index_add_(0, inverse, features)
+
+    input_tensor._coalesced_indices_cache = decoded
+    input_tensor._coalesced_inverse_cache = inverse
+    input_tensor._coalesced_is_unique = False
+    return out, decoded, True
+
 
 def _try_implicit_gemm(features, filters, indice_pairs, indice_pair_num, num_activate_out):
     """Try cumm-rocm implicit GEMM only when explicitly enabled.
@@ -518,9 +597,8 @@ def _get_indice_pairs_hip(indices: torch.Tensor,
         # SubM: output == input
         ip, ip_num = hip.get_indice_pairs_subm(
             indices_i32, batch_size, spatial_shape, ksize, dilation)
-        # ip: [2, kv, N] → transpose to [kv, 2, N]
-        ip = ip.permute(1, 0, 2).contiguous()
-        return indices.clone(), ip, ip_num
+        # HIP kernels already return contiguous [kv, 2, N].
+        return indices, ip, ip_num
     else:
         # Regular / transposed conv
         if transposed:
@@ -532,8 +610,7 @@ def _get_indice_pairs_hip(indices: torch.Tensor,
         out_inds, ip, ip_num = hip.get_indice_pairs_conv(
             indices_i32, batch_size, spatial_shape, out_spatial,
             ksize, stride, padding, dilation, transposed)
-        # ip: [2, kv, N] → transpose to [kv, 2, N]
-        ip = ip.permute(1, 0, 2).contiguous()
+        # HIP kernels already return contiguous [kv, 2, N].
         return out_inds, ip, ip_num
 
 
@@ -591,16 +668,22 @@ class _IndiceConvFusedFunction(Function):
                 indice_pair_num: torch.Tensor,
                 num_activate_out: int,
                 inverse: bool,
-                subm: bool) -> torch.Tensor:
+                subm: bool,
+                assume_unique_indices: bool) -> torch.Tensor:
         hip = _get_hip_module()
         if hip is None or not features.is_cuda:
             raise RuntimeError(
                 "_IndiceConvFusedFunction requires the HIP extension and a CUDA/HIP tensor"
             )
 
-        out = hip.indice_conv_forward_fused(
-            features, filters, indice_pairs, indice_pair_num,
-            num_activate_out, inverse, subm)
+        if assume_unique_indices and hasattr(hip, "indice_conv_forward_fused_unique"):
+            out = hip.indice_conv_forward_fused_unique(
+                features, filters, indice_pairs, indice_pair_num,
+                num_activate_out, inverse, subm)
+        else:
+            out = hip.indice_conv_forward_fused(
+                features, filters, indice_pairs, indice_pair_num,
+                num_activate_out, inverse, subm)
         ctx.save_for_backward(features, filters, indice_pairs, indice_pair_num)
         ctx.inverse = inverse
         ctx.subm = subm
@@ -622,7 +705,7 @@ class _IndiceConvFusedFunction(Function):
                 din = None
             if not ctx.needs_input_grad[1]:
                 dfilters = None
-        return din, dfilters, None, None, None, None, None
+        return din, dfilters, None, None, None, None, None, None
 
 
 def get_indice_pairs(indices: torch.Tensor,
@@ -666,7 +749,8 @@ def indice_conv(features: torch.Tensor,
                 inverse: bool = False,
                 subm: bool = False,
                 algo: ConvAlgo = ConvAlgo.Native,
-                timer=None) -> torch.Tensor:
+                timer=None,
+                assume_unique_indices: bool = False) -> torch.Tensor:
     """Sparse convolution dispatch.
 
     On ROCm, the default fp32 route is the DetZero fused HIP forward plus
@@ -710,11 +794,16 @@ def indice_conv(features: torch.Tensor,
             if features.requires_grad or filters.requires_grad:
                 out = _IndiceConvFusedFunction.apply(
                     features, filters, indice_pairs, indice_pair_num,
-                    num_activate_out, inverse, subm)
+                    num_activate_out, inverse, subm, assume_unique_indices)
                 return _cast_output_for_autocast(out, features, filters)
-            out = hip.indice_conv_forward_fused(
-                features, filters, indice_pairs, indice_pair_num,
-                num_activate_out, inverse, subm)
+            if assume_unique_indices and hasattr(hip, "indice_conv_forward_fused_unique"):
+                out = hip.indice_conv_forward_fused_unique(
+                    features, filters, indice_pairs, indice_pair_num,
+                    num_activate_out, inverse, subm)
+            else:
+                out = hip.indice_conv_forward_fused(
+                    features, filters, indice_pairs, indice_pair_num,
+                    num_activate_out, inverse, subm)
             return _cast_output_for_autocast(out, features, filters)
         if _use_explicit_backward() and (features.requires_grad or filters.requires_grad):
             out = _IndiceConvFunction.apply(
