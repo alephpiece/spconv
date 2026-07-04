@@ -11,7 +11,7 @@ _CURRENT_ALGORITHM = None
 
 
 def _enabled() -> bool:
-    return os.environ.get("SPCONV_ROCM_FLEXGEMM_SUBM", "0") in _TRUE_VALUES
+    return os.environ.get("SPCONV_ROCM_FLEXGEMM_SUBM", "1") in _TRUE_VALUES
 
 
 def _debug() -> bool:
